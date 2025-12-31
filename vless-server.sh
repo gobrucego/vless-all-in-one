@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.0.8 [服务端]
+#  多协议代理一键部署脚本 v3.0.9 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -16,7 +16,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.0.8"
+readonly VERSION="3.0.9"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -5413,13 +5413,21 @@ db_add_routing_rule() {
     fi
 }
 
-# 数据库：删除分流规则
+# 数据库：删除分流规则 (支持按 id 或 type 删除)
+# 用法: db_del_routing_rule "rule_id" 或 db_del_routing_rule "type" "by_type"
 db_del_routing_rule() {
-    local rule_type="$1"
+    local identifier="$1"
+    local mode="${2:-by_id}"  # 默认按 id 删除
     [[ ! -f "$DB_FILE" ]] && return
     
     local tmp=$(mktemp)
-    jq --arg type "$rule_type" '.routing_rules = [.routing_rules[]? | select(.type != $type)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    if [[ "$mode" == "by_type" ]]; then
+        # 按 type 删除 (删除所有同类型规则)
+        jq --arg type "$identifier" '.routing_rules = [.routing_rules[]? | select(.type != $type)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    else
+        # 按 id 删除 (只删除单个规则)
+        jq --arg id "$identifier" '.routing_rules = [.routing_rules[]? | select(.id != $id)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    fi
 }
 
 # 数据库：获取所有分流规则
@@ -6016,27 +6024,38 @@ _del_routing_rule() {
     
     # 显示规则列表
     local idx=1
-    local rule_types=()
+    local rule_ids=()
     while IFS= read -r rule; do
         [[ -z "$rule" ]] && continue
+        local rule_id=$(echo "$rule" | jq -r '.id')
         local rule_type=$(echo "$rule" | jq -r '.type')
         local outbound=$(echo "$rule" | jq -r '.outbound')
+        local domains=$(echo "$rule" | jq -r '.domains // ""')
         local rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
-        [[ "$rule_type" == "custom" ]] && rule_name="自定义"
+        
+        # 自定义规则显示域名
+        if [[ "$rule_type" == "custom" ]]; then
+            # 截取域名显示，过长则省略
+            local display_domains="$domains"
+            if [[ ${#domains} -gt 30 ]]; then
+                display_domains="${domains:0:27}..."
+            fi
+            rule_name="自定义 (${display_domains})"
+        fi
         [[ "$rule_type" == "all" ]] && rule_name="所有流量"
         local outbound_name=$(_get_outbound_display_name "$outbound")
         
         echo -e "  ${G}${idx})${NC} ${rule_name} → ${outbound_name}"
-        rule_types+=("$rule_type")
+        rule_ids+=("$rule_id")
         ((idx++))
     done < <(echo "$rules" | jq -c '.[]')
     
     echo ""
     read -rp "  输入序号删除 (0 返回): " del_choice
     
-    if [[ "$del_choice" =~ ^[0-9]+$ ]] && [[ "$del_choice" -ge 1 && "$del_choice" -le ${#rule_types[@]} ]]; then
-        local del_type="${rule_types[$((del_choice-1))]}"
-        db_del_routing_rule "$del_type"
+    if [[ "$del_choice" =~ ^[0-9]+$ ]] && [[ "$del_choice" -ge 1 && "$del_choice" -le ${#rule_ids[@]} ]]; then
+        local del_id="${rule_ids[$((del_choice-1))]}"
+        db_del_routing_rule "$del_id"
         _regenerate_proxy_configs
         _ok "已删除规则"
     fi
