@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.0.7 [服务端]
+#  多协议代理一键部署脚本 v3.0.8 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -8,7 +8,7 @@
 #  
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
-#           Snell v4 / Snell v5 / AnyTLS / TUIC (共13种)
+#           Snell v4 / Snell v5 / AnyTLS / TUIC / NaïveProxy (共14种)
 #  插件支持: Snell v4/v5 和 SS2022 可选启用 ShadowTLS
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #  
@@ -6549,13 +6549,15 @@ parse_proxy_link() {
             local pbk=$(echo "$params" | grep -oP 'pbk=\K[^&]+' || echo "")
             local sid=$(echo "$params" | grep -oP 'sid=\K[^&]+' || echo "")
             local flow=$(echo "$params" | grep -oP 'flow=\K[^&]+' || echo "")
+            local encryption=$(echo "$params" | grep -oP 'encryption=\K[^&]+' || echo "none")
+            [[ -z "$encryption" ]] && encryption="none"
             
             [[ -z "$name" ]] && name="VLESS-${host##*.}"
             [[ -n "$host" && -n "$port" && -n "$uuid" ]] && result=$(jq -nc \
                 --arg name "$name" --arg host "$host" --argjson port "$port" \
                 --arg uuid "$uuid" --arg security "$security" --arg sni "$sni" \
-                --arg fp "$fp" --arg net "$net" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" \
-                '{name:$name,type:"vless",server:$host,port:$port,uuid:$uuid,security:$security,sni:$sni,fingerprint:$fp,network:$net,publicKey:$pbk,shortId:$sid,flow:$flow}')
+                --arg fp "$fp" --arg net "$net" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg enc "$encryption" \
+                '{name:$name,type:"vless",server:$host,port:$port,uuid:$uuid,security:$security,sni:$sni,fingerprint:$fp,network:$net,publicKey:$pbk,shortId:$sid,flow:$flow,encryption:$enc}')
             ;;
         trojan://*)
             # Trojan 格式: trojan://password@host:port?params#name
@@ -6651,6 +6653,10 @@ gen_xray_chain_outbound() {
     local server=$(echo "$node" | jq -r '.server')
     local port=$(echo "$node" | jq -r '.port')
     
+    # 确保 port 是纯数字（去除可能的引号和空白）
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    [[ ! "$port" =~ ^[0-9]+$ ]] && { echo ""; return 1; }
+    
     case "$type" in
         socks)
             local username=$(echo "$node" | jq -r '.username // ""')
@@ -6686,12 +6692,15 @@ gen_xray_chain_outbound() {
         vmess)
             local uuid=$(echo "$node" | jq -r '.uuid')
             local aid=$(echo "$node" | jq -r '.alterId // 0')
+            # 确保 aid 是数字
+            aid=$(echo "$aid" | tr -d '"' | tr -d ' ')
+            [[ ! "$aid" =~ ^[0-9]+$ ]] && aid=0
             local net=$(echo "$node" | jq -r '.network // "tcp"')
             local tls=$(echo "$node" | jq -r '.tls')
             local path=$(echo "$node" | jq -r '.wsPath // "/"')
             local wshost=$(echo "$node" | jq -r '.wsHost // ""')
             
-            local stream='{network:"tcp"}'
+            local stream='{"network":"tcp"}'
             [[ "$net" == "ws" ]] && stream=$(jq -n --arg net "$net" --arg path "$path" --arg host "$wshost" \
                 '{network:$net,wsSettings:{path:$path,headers:{Host:$host}}}')
             [[ "$tls" == "tls" ]] && stream=$(echo "$stream" | jq --arg sni "$server" '.security="tls"|.tlsSettings={serverName:$sni}')
@@ -6707,8 +6716,11 @@ gen_xray_chain_outbound() {
             local pbk=$(echo "$node" | jq -r '.publicKey // ""')
             local sid=$(echo "$node" | jq -r '.shortId // ""')
             local flow=$(echo "$node" | jq -r '.flow // ""')
+            local encryption=$(echo "$node" | jq -r '.encryption // "none"')
+            # 如果 encryption 为空，默认使用 none
+            [[ -z "$encryption" ]] && encryption="none"
             
-            local stream='{network:"tcp"}'
+            local stream='{"network":"tcp"}'
             if [[ "$security" == "reality" ]]; then
                 stream=$(jq -n --arg sni "$sni" --arg fp "$fp" --arg pbk "$pbk" --arg sid "$sid" \
                     '{network:"tcp",security:"reality",realitySettings:{serverName:$sni,fingerprint:$fp,publicKey:$pbk,shortId:$sid}}')
@@ -6718,12 +6730,12 @@ gen_xray_chain_outbound() {
             fi
             
             # 生成 outbound，如果有 flow 则添加
-            if [[ -n "$flow" && "$flow" != "null" ]]; then
-                jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --arg flow "$flow" --argjson stream "$stream" \
-                    '{tag:$tag,protocol:"vless",settings:{vnext:[{address:$server,port:$port,users:[{id:$uuid,encryption:"none",flow:$flow}]}]},streamSettings:$stream}'
+            if [[ -n "$flow" && "$flow" != "null" && "$flow" != "" ]]; then
+                jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --arg enc "$encryption" --arg flow "$flow" --argjson stream "$stream" \
+                    '{tag:$tag,protocol:"vless",settings:{vnext:[{address:$server,port:$port,users:[{id:$uuid,encryption:$enc,flow:$flow}]}]},streamSettings:$stream}'
             else
-                jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --argjson stream "$stream" \
-                    '{tag:$tag,protocol:"vless",settings:{vnext:[{address:$server,port:$port,users:[{id:$uuid,encryption:"none"}]}]},streamSettings:$stream}'
+                jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --arg enc "$encryption" --argjson stream "$stream" \
+                    '{tag:$tag,protocol:"vless",settings:{vnext:[{address:$server,port:$port,users:[{id:$uuid,encryption:$enc}]}]},streamSettings:$stream}'
             fi
             ;;
         trojan)
@@ -9530,7 +9542,7 @@ parse_vless_link() {
     local params="${content#*\?}"
     
     # 解析参数
-    local security="" type="" sni="" pbk="" sid="" flow="" path="" host="" fp=""
+    local security="" type="" sni="" pbk="" sid="" flow="" path="" host="" fp="" encryption=""
     IFS='&' read -ra PARAMS <<< "$params"
     for param in "${PARAMS[@]}"; do
         local key="${param%%=*}"
@@ -9546,26 +9558,37 @@ parse_vless_link() {
             path) path="$value" ;;
             host) host="$value" ;;
             fp) fp="$value" ;;
+            encryption) encryption="$value" ;;
+            headerType) ;; # 忽略
         esac
     done
     
-    # 输出 JSON 格式 (使用 jq 确保正确转义)
+    # 确保 port 是纯数字，无效则报错
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "错误: 无法解析端口号 '$port'" >&2
+        return 1
+    fi
+    
+    # 输出 JSON 格式 (使用 jq 确保正确转义，port 使用 argjson 存储为数字)
+    # 注意：字段名使用完整名称以便 gen_xray_chain_outbound 正确读取
     jq -nc \
         --arg type "vless" \
         --arg name "$name" \
         --arg server "$server" \
-        --arg port "$port" \
+        --argjson port "$port" \
         --arg uuid "$uuid" \
         --arg security "$security" \
-        --arg transport "$type" \
+        --arg transport "${type:-tcp}" \
         --arg sni "$sni" \
-        --arg pbk "$pbk" \
-        --arg sid "$sid" \
+        --arg publicKey "$pbk" \
+        --arg shortId "$sid" \
         --arg flow "$flow" \
         --arg path "$path" \
         --arg host "$host" \
-        --arg fp "$fp" \
-        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,security:$security,transport:$transport,sni:$sni,pbk:$pbk,sid:$sid,flow:$flow,path:$path,host:$host,fp:$fp}'
+        --arg fingerprint "${fp:-chrome}" \
+        --arg encryption "$encryption" \
+        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,security:$security,transport:$transport,sni:$sni,publicKey:$publicKey,shortId:$shortId,flow:$flow,path:$path,host:$host,fingerprint:$fingerprint,encryption:$encryption}'
 }
 
 # 解析 vmess:// 链接
@@ -9588,9 +9611,29 @@ parse_vmess_link() {
     local tls=$(echo "$json" | jq -r '.tls // ""')
     local sni=$(echo "$json" | jq -r '.sni // ""')
     
-    cat << EOF
-{"type":"vmess","name":"$name","server":"$server","port":"$port","uuid":"$uuid","aid":"$aid","network":"$net","host":"$host","path":"$path","tls":"$tls","sni":"$sni"}
-EOF
+    # 确保 port 和 aid 是数字
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "错误: 无法解析端口号 '$port'" >&2
+        return 1
+    fi
+    aid=$(echo "$aid" | tr -d '"' | tr -d ' ')
+    [[ ! "$aid" =~ ^[0-9]+$ ]] && aid="0"
+    
+    # 使用 jq 生成 JSON，确保 port 和 aid 是数字
+    jq -nc \
+        --arg type "vmess" \
+        --arg name "$name" \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --argjson aid "$aid" \
+        --arg network "$net" \
+        --arg host "$host" \
+        --arg path "$path" \
+        --arg tls "$tls" \
+        --arg sni "$sni" \
+        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,aid:$aid,network:$network,host:$host,path:$path,tls:$tls,sni:$sni}'
 }
 
 # 解析 trojan:// 链接
@@ -9628,9 +9671,23 @@ parse_trojan_link() {
         esac
     done
     
-    cat << EOF
-{"type":"trojan","name":"$name","server":"$server","port":"$port","password":"$password","sni":"$sni","transport":"$type"}
-EOF
+    # 确保 port 是数字
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "错误: 无法解析端口号 '$port'" >&2
+        return 1
+    fi
+    
+    # 使用 jq 生成 JSON
+    jq -nc \
+        --arg type "trojan" \
+        --arg name "$name" \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --arg transport "$type" \
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,transport:$transport}'
 }
 
 # 解析 ss:// 链接
@@ -9681,9 +9738,22 @@ parse_ss_link() {
         fi
     fi
     
-    cat << EOF
-{"type":"ss","name":"$name","server":"$server","port":"$port","method":"$method","password":"$password"}
-EOF
+    # 确保 port 是数字
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "错误: 无法解析端口号 '$port'" >&2
+        return 1
+    fi
+    
+    # 使用 jq 生成 JSON
+    jq -nc \
+        --arg type "ss" \
+        --arg name "$name" \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --arg method "$method" \
+        --arg password "$password" \
+        '{type:$type,name:$name,server:$server,port:$port,method:$method,password:$password}'
 }
 
 # 解析 hysteria2:// 链接
@@ -9722,9 +9792,22 @@ parse_hy2_link() {
         esac
     done
     
-    cat << EOF
-{"type":"hysteria2","name":"$name","server":"$server","port":"$port","password":"$password","sni":"$sni"}
-EOF
+    # 确保 port 是数字
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "错误: 无法解析端口号 '$port'" >&2
+        return 1
+    fi
+    
+    # 使用 jq 生成 JSON
+    jq -nc \
+        --arg type "hysteria2" \
+        --arg name "$name" \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni}'
 }
 
 # 解析 anytls:// 链接
@@ -9761,9 +9844,22 @@ parse_anytls_link() {
         esac
     done
     
-    cat << EOF
-{"type":"anytls","name":"$name","server":"$server","port":"$port","password":"$password","sni":"$sni"}
-EOF
+    # 确保 port 是数字
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "错误: 无法解析端口号 '$port'" >&2
+        return 1
+    fi
+    
+    # 使用 jq 生成 JSON
+    jq -nc \
+        --arg type "anytls" \
+        --arg name "$name" \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni}'
 }
 
 # 解析任意分享链接
