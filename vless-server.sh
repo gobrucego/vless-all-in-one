@@ -750,31 +750,12 @@ generate_xray_config() {
                 done < <(echo "$group_json" | jq -r '.nodes[]?')
                 
                 # 生成 balancer 配置
-                # 检查出站协议类型,SOCKS5/HTTP不支持leastPing/leastLoad,自动降级为random
-                local final_strategy="$strategy"
-                if [[ "$strategy" == "leastPing" || "$strategy" == "leastLoad" ]]; then
-                    # 检查selector中的节点是否包含SOCKS5/HTTP协议
-                    local has_incompatible=false
-                    while IFS= read -r check_tag; do
-                        [[ -z "$check_tag" ]] && continue
-                        if echo "$outbounds" | jq -e --arg tag "$check_tag" '.[] | select(.tag == $tag and (.protocol == "socks" or .protocol == "http"))' >/dev/null 2>&1; then
-                            has_incompatible=true
-                            break
-                        fi
-                    done < <(echo "$selectors" | jq -r '.[]?')
-
-                    if [[ "$has_incompatible" == "true" ]]; then
-                        _warn "检测到SOCKS5/HTTP出站,${strategy}策略不支持,自动切换为random策略"
-                        final_strategy="random"
-                    fi
-                fi
-
                 local balancer=$(jq -n \
                     --arg tag "balancer-${group_name}" \
-                    --arg strategy "$final_strategy" \
+                    --arg strategy "$strategy" \
                     --argjson selector "$selectors" \
                     '{tag: $tag, selector: $selector, strategy: {type: $strategy}}')
-                
+
                 balancers=$(echo "$balancers" | jq --argjson b "$balancer" '. + [$b]')
             done < <(echo "$balancer_groups" | jq -c '.[]')
         fi
@@ -857,11 +838,59 @@ generate_xray_config() {
             outbounds: $outbounds,
             routing: {domainStrategy: "IPIfNonMatch", rules: [], balancers: $balancers}
         }' > "$CFG/config.json"
-        
+
         # 添加路由规则
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             local tmp=$(mktemp)
             jq --argjson rules "$routing_rules" '.routing.rules = $rules' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+        fi
+
+        # 检查是否使用了leastPing或leastLoad策略,添加burstObservatory配置
+        local needs_observatory=false
+        if [[ -n "$balancer_groups" && "$balancer_groups" != "[]" ]]; then
+            while IFS= read -r group_json; do
+                local strategy=$(echo "$group_json" | jq -r '.strategy')
+                if [[ "$strategy" == "leastPing" || "$strategy" == "leastLoad" ]]; then
+                    needs_observatory=true
+                    break
+                fi
+            done < <(echo "$balancer_groups" | jq -c '.[]')
+        fi
+
+        if [[ "$needs_observatory" == "true" ]]; then
+            # 构建subjectSelector: 使用通配符匹配所有链式代理出站
+            # 示例: ["chain-Alice-TW-SOCKS5-"] 将匹配所有Alice节点
+            local subject_selectors="[]"
+            while IFS= read -r group_json; do
+                local strategy=$(echo "$group_json" | jq -r '.strategy')
+                if [[ "$strategy" == "leastPing" || "$strategy" == "leastLoad" ]]; then
+                    # 提取节点名前缀用于通配
+                    local first_node=$(echo "$group_json" | jq -r '.nodes[0] // ""')
+                    if [[ -n "$first_node" ]]; then
+                        # 提取公共前缀 (例如 Alice-TW-SOCKS5-01 -> Alice-TW-SOCKS5)
+                        local prefix=$(echo "$first_node" | sed 's/-[0-9][0-9]*$//')
+                        local tag_prefix="chain-${prefix}-"
+                        # 避免重复添加相同前缀
+                        if ! echo "$subject_selectors" | jq -e --arg p "$tag_prefix" '.[] | select(. == $p)' >/dev/null 2>&1; then
+                            subject_selectors=$(echo "$subject_selectors" | jq --arg p "$tag_prefix" '. + [$p]')
+                        fi
+                    fi
+                fi
+            done < <(echo "$balancer_groups" | jq -c '.[]')
+
+            # 添加burstObservatory配置
+            local tmp=$(mktemp)
+            jq --argjson selectors "$subject_selectors" '
+                .burstObservatory = {
+                    subjectSelector: $selectors,
+                    pingConfig: {
+                        destination: "https://www.gstatic.com/generate_204",
+                        interval: "10s",
+                        sampling: 2,
+                        timeout: "5s"
+                    }
+                }
+            ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
         fi
     else
         # 无分流规则时沿用直连出口配置，确保 direct_ip_version 生效
@@ -5709,8 +5738,9 @@ generate_singbox_config() {
                                 tag: $tag,
                                 outbounds: $outbounds,
                                 url: "https://www.gstatic.com/generate_204",
-                                interval: "5m",
-                                tolerance: 50
+                                interval: "10s",
+                                tolerance: 50,
+                                idle_timeout: "30m"
                             }')
                         ;;
                     random|roundRobin|*)
@@ -8631,8 +8661,8 @@ db_clear_routing_rules() {
 
 # 数据库：添加负载均衡组
 # 用法: db_add_balancer_group "组名" "策略" "节点1" "节点2" ...
-# 策略: random(随机), roundRobin(轮询)
-# 注意: leastPing/leastLoad不支持SOCKS5/HTTP出站,配置生成时会自动降级为random
+# 策略: random(随机), roundRobin(轮询), leastPing(最低延迟), leastLoad(最低负载)
+# 注意: leastPing/leastLoad需要Observatory配置,配置生成时会自动添加burstObservatory
 db_add_balancer_group() {
     local name="$1" strategy="$2"
     shift 2
@@ -12348,18 +12378,22 @@ _create_alice_balancer_inline() {
 
     echo ""
     echo -e "  ${W}配置负载均衡策略:${NC}"
-    echo -e "    ${C}1.${NC} random      ${D}(随机选择 - 推荐)${NC}"
-    echo -e "    ${C}2.${NC} roundRobin  ${D}(轮询 - 流量均衡)${NC}"
+    echo -e "    ${C}1.${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
+    echo -e "    ${C}2.${NC} random      ${D}(随机选择)${NC}"
+    echo -e "    ${C}3.${NC} roundRobin  ${D}(轮询 - 流量均衡)${NC}"
+    echo ""
+    echo -e "  ${Y}说明:${NC} leastPing会自动选择延迟最低的节点"
     echo ""
 
     local strategy_choice
-    read -p "  请选择策略 [1-2, 默认 1]: " strategy_choice
+    read -p "  请选择策略 [1-3, 默认 1]: " strategy_choice
     strategy_choice=${strategy_choice:-1}
 
     local strategy
     case "$strategy_choice" in
-        2) strategy="roundRobin" ;;
-        *) strategy="random" ;;
+        2) strategy="random" ;;
+        3) strategy="roundRobin" ;;
+        *) strategy="leastPing" ;;
     esac
 
     # 获取所有 Alice 节点
